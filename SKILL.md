@@ -4,8 +4,8 @@ description: >
   Cross-platform search and research across Chinese social platforms.
   Search WeChat, Weibo, XiaoHongShu, Douban, Zhihu in parallel.
   Deep-read posts with comments. Generate Markdown research reports.
-  Triggers: "调研", "跨平台搜", "帮我调研", "全网搜", "research",
-  "cross-platform search"
+  Triggers: "调研", "研究", "跨平台搜", "帮我调研", "全网搜", "帮我搜",
+  "搜一搜", "了解一下", "research", "cross-platform search"
 ---
 
 # Cross-Platform Research Skill
@@ -33,6 +33,10 @@ Before running searches, verify that the required tools are available:
 ### Platform Commands
 
 Replace `QUERY` with the user's search query.
+
+**Important: WeChat (miku_ai) works best with short keywords (2-4 Chinese characters).** If the user's query is long (e.g., "靠谱容易上手的副业"), extract the core keyword (e.g., "副业推荐") for the WeChat search. Other platforms handle long queries fine.
+
+**Important: Always use the CURRENT YEAR from the system date when constructing search queries.** Do NOT default to your training data cutoff year. For example, if today is 2026-03-24, use "2026" in queries like "2026 副业推荐", not "2025".
 
 **WeChat (微信公众号):**
 ```bash
@@ -68,7 +72,7 @@ mcporter call 'exa.web_search_exa(query: "QUERY site:zhihu.com", numResults: 10)
 
 ### Execution Rules
 
-1. **All 5 searches MUST run as 5 simultaneous Bash tool calls in a single response.** This is how Claude Code achieves parallelism — do NOT run them sequentially. Each platform gets its own Bash tool call, all issued in the same message.
+1. **All 5 searches MUST run as 5 simultaneous Bash tool calls in a single response.** This is how Claude Code achieves parallelism — do NOT run them sequentially. Each platform gets its own Bash tool call, all issued in the same message. **If one parallel call fails/errors and causes other calls to be cancelled, immediately retry the cancelled calls** — do not skip them just because they were collateral damage.
 
 2. **Default behavior**: Search all 5 platforms. The user can specify a subset:
    - "只搜微博和知乎" → only Weibo + Zhihu
@@ -79,7 +83,9 @@ mcporter call 'exa.web_search_exa(query: "QUERY site:zhihu.com", numResults: 10)
    - User can override count, e.g. "每个平台搜5条" → set `top_num=5`, `limit: 5`, `numResults: 5` accordingly.
    - XiaoHongShu count cannot be overridden.
 
-4. After all searches complete, briefly summarize result counts per platform before proceeding to Phase 2.
+4. **Auto-retry on empty results**: If a platform returns empty results (e.g., WeChat returns `[]`), immediately retry with a shorter/broader keyword (e.g., extract the core 2-4 character keyword from the user's query). Do NOT ask the user — just retry autonomously. If 2 retries still return empty, then skip and note it.
+
+5. After all searches complete, briefly summarize result counts per platform before proceeding to Phase 2.
 
 ---
 
@@ -127,9 +133,10 @@ After presenting the table, ask the user:
 ```
 
 **"auto" selection criteria:** Pick 3–5 posts prioritizing:
-1. Diversity across platforms (at least one from each platform that returned results)
-2. Highest engagement metrics
-3. Recency
+1. **Filter out ads/promotional content first** — skip posts that are obviously selling courses, recruiting agents, or contain "加微信/点卡片/扣1" type CTAs. Also skip posts from corporate accounts promoting their own products. Note which posts were excluded as ads so the user knows.
+2. Diversity across platforms (at least one from each platform that returned results)
+3. Highest engagement metrics (but be wary of inflated metrics — e.g., comment count >> like count may indicate bot activity)
+4. Recency
 
 If user says "skip", end the skill. Otherwise proceed to Phase 3.
 
@@ -174,12 +181,9 @@ Field mapping from Phase 1 search results: `feed_id` = result `id` field, `xsec_
 
 Two paths based on URL:
 
-**Public pages** (movie.douban.com, book.douban.com, douban.com/note):
-```bash
-curl -s "https://r.jina.ai/URL"
-```
+**Default: use Camoufox for ALL douban.com pages** (Jina Reader frequently fails even on public pages like /note/, returning empty "载入中" content). Use cookie injection if cookie file exists, otherwise run without cookies:
 
-**Login-gated pages** (douban.com/group/topic):
+**If `~/.agent-reach/cookies/douban.json` exists** (login-gated and public pages):
 
 Use Camoufox with cookie injection:
 ```python
@@ -224,7 +228,7 @@ with Camoufox(headless=True) as browser:
 
 ### Report Generation
 
-After deep-reading all selected posts, generate a research report and save to `/tmp/research-<topic>-<YYYYMMDD-HHmm>.md`.
+After deep-reading all selected posts, generate a research report and save to `~/Documents/claude/research/research-<topic>-<YYYYMMDD-HHmm>.md` (create the directory if it doesn't exist).
 
 Report structure:
 ```markdown
@@ -234,7 +238,11 @@ Report structure:
 ## 概述
 <1-2 paragraph summary of key findings across platforms>
 
-## 各平台详情
+## 搜索结果汇总
+
+Include the Phase 2 structured summary tables here (all platforms), preserving the original table format with numbering, engagement metrics, and links. Mark ads/promotional content with ⚠️. Bold the posts selected for deep reading. This section serves as a permanent index of all search results.
+
+## 各平台详情（深读）
 
 ### 微信公众号
 #### <Article Title>
@@ -281,13 +289,22 @@ Report structure:
 - <finding 3>
 ```
 
-After saving, tell the user: "调研报告已保存到 `/tmp/research-<topic>-<timestamp>.md`"
+After saving, tell the user: "调研报告已保存到 `~/Documents/claude/research/research-<topic>-<timestamp>.md`"
 
 ---
 
 ## Error Handling
 
+**Core principle: exhaust all self-service recovery before asking the user.** Only ask the user when you truly cannot proceed (e.g., need them to scan a QR code or unlock a physical device).
+
 - **Platform search fails**: Log warning, continue with other platforms. In Phase 2 summary, note which platforms failed.
+- **Search returns empty**: Auto-retry with shorter/broader keywords (up to 2 retries). Do NOT ask the user.
+- **XiaoHongShu offline (ECONNREFUSED on port 18060)**: This is a Docker-based MCP service. Self-recover in order:
+  1. Check Docker status: `docker ps -a | grep xiaohongshu`
+  2. If Docker Desktop is paused → ask user to unpause (this requires GUI interaction)
+  3. If container exists but stopped → `docker start xiaohongshu-mcp`
+  4. Wait 3s, verify with `mcporter list xiaohongshu`
+  5. If container doesn't exist → inform user the container needs to be recreated
 - **Deep read timeout**: Skip that post, note it in the report as "内容获取失败".
 - **Douban cookie expired/missing**: Fall back to Jina Reader for public pages, skip login-gated pages, warn user: "豆瓣 cookie 已过期，请重新导出 cookie 到 ~/.agent-reach/cookies/douban.json"
 - **miku_ai not installed**: Auto-install with `https_proxy= http_proxy= pip3 install miku-ai`
